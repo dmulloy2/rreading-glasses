@@ -33,28 +33,15 @@ type batchedgqlclient struct {
 	queue     []batchedQuery // queue contains spillover in cases where we've accumulated more queries than our batch size allows.
 	every     time.Duration  // every controls how often requests are flushed.
 	metrics   *gqlMetrics    // metrics tracks batches and queries sent.
-	limiter   *tokenBucket   // limiter, when set, paces batches so we stay inside the upstream's rate limit.
 
 	wrapped graphql.Client
 }
 
-// BatchedOption configures a batching GraphQL client.
-type BatchedOption func(*batchedgqlclient, *int)
-
-// WithRateLimit paces batches so that no more than perMinute queries are sent
-// per minute on average, allowing bursts of up to one full batch. This matches
-// token-bucket limits like Hardcover's, where each top-level field costs one
-// token and a request larger than the burst allowance is rejected outright.
-// Zero or less leaves the client unpaced.
-func WithRateLimit(perMinute int) BatchedOption {
-	return func(_ *batchedgqlclient, rate *int) {
-		*rate = perMinute
-	}
-}
-
 // NewBatchedGraphQLClient creates a batching GraphQL client. Queries are
-// accumulated and executed regularly accurding to the given rate.
-func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duration, batchSize int, reg *prometheus.Registry, opts ...BatchedOption) (graphql.Client, error) {
+// accumulated and executed regularly accurding to the given rate. Each request
+// carries its query count (see WithQueryCost), so a PacedTransport in client
+// can keep the upstream inside its rate limit.
+func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duration, batchSize int, reg *prometheus.Registry) (graphql.Client, error) {
 	wrapped := graphql.NewClient(url, client)
 
 	c := &batchedgqlclient{
@@ -63,14 +50,6 @@ func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duratio
 		queue:     []batchedQuery{},
 		metrics:   newGQLMetrics(reg),
 		every:     every,
-	}
-
-	perMinute := 0
-	for _, opt := range opts {
-		opt(c, &perMinute)
-	}
-	if perMinute > 0 {
-		c.limiter = newTokenBucket(perMinute, batchSize, time.Now)
 	}
 
 	go func() {
@@ -120,21 +99,58 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 	batch := c.queue[0]
 	c.queue = c.queue[1:]
 
-	// Reserve budget for the batch. If we're ahead of the rate limit it waits
-	// its turn before it's sent. Reserving, rather than waiting for enough
-	// budget to appear, keeps a large batch from being starved by small ones
-	// that arrive after it.
-	var wait time.Duration
-	if c.limiter != nil {
-		wait = c.limiter.reserve(len(batch.subscribers))
+	// Issue the request in a separate goroutine so we can continue to
+	// accumulate queries without needing to wait for the network call.
+	go c.send(ctx, batch)
+}
+
+// send executes a batch. Subscribers who stopped waiting are dropped first, so
+// an abandoned lookup doesn't spend rate-limit budget that current ones need,
+// and the request is called off if everyone still in it gives up while it
+// waits for budget.
+func (c *batchedgqlclient) send(ctx context.Context, batch batchedQuery) {
+	live := map[string]*subscription{}
+	for id, sub := range batch.subscribers {
+		if err := sub.ctx.Err(); err != nil {
+			sub.respC <- err
+			continue
+		}
+		live[id] = sub
+	}
+	if len(live) == 0 {
+		return
 	}
 
-	c.metrics.batchesSentInc()
-	c.metrics.queriesSentAdd(int64(len(batch.subscribers)))
+	qb := batch.qb
+	if len(live) < len(batch.subscribers) {
+		// Rebuild the query from the queries still wanted.
+		qb = newQueryBuilder()
+		rebuilt := map[string]*subscription{}
+		for _, sub := range live {
+			id, field, err := qb.add(sub.query, sub.vars)
+			if err != nil {
+				sub.respC <- err
+				continue
+			}
+			sub.field = field
+			rebuilt[id] = sub
+		}
+		live = rebuilt
+		if len(live) == 0 {
+			return
+		}
+	}
+	batch.subscribers = live
 
-	query, vars, err := batch.qb.build()
+	c.metrics.batchesSentInc()
+	c.metrics.queriesSentAdd(int64(len(live)))
+
+	query, vars, err := qb.build()
 	if err != nil {
 		Log(ctx).Error("unable to build query", "err", err)
+		for _, sub := range live {
+			sub.respC <- err
+		}
 		return
 	}
 
@@ -142,57 +158,64 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 	req := &graphql.Request{
 		Query:     query,
 		Variables: vars,
-		OpName:    batch.qb.op.Name.Value,
+		OpName:    qb.op.Name.Value,
 	}
 	resp := &graphql.Response{
 		Data: &data,
 	}
 
-	// Issue the request in a separate goroutine so we can continue to
-	// accumulate queries without needing to wait for the network call.
-	go func(batch batchedQuery) {
-		time.Sleep(wait)
-
-		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-
-		err := c.wrapped.MakeRequest(ctx, req, resp)
-
-		// Extract any field-level errors, and return them to their
-		// subscribers. We can ignore the top-level err in this case, because
-		// it's just the wrapped version of our response errors.
-		if resp != nil && len(resp.Errors) > 0 {
-			for _, e := range resp.Errors {
-				sub, ok := batch.subscribers[e.Path.String()]
-				if !ok {
-					continue
-				}
-				sub.respC <- gqlStatusErr(e)
-				// Remove our subscriber because we already responded.
-				delete(batch.subscribers, e.Path.String())
+	// The batch outlives the flush loop's context only as long as somebody
+	// still wants its answer. Callers without a deadline, like background
+	// author refreshes, keep it alive for as long as it takes.
+	ctx, cancel := context.WithCancel(WithQueryCost(context.WithoutCancel(ctx), len(live)))
+	defer cancel()
+	go func() {
+		for _, sub := range live {
+			select {
+			case <-sub.ctx.Done():
+			case <-ctx.Done():
+				return
 			}
-		} else if err != nil {
-			// For everything else return the status code to all our subscribers.
-			Log(ctx).Warn("batched query error", "count", len(batch.subscribers), "err", err, "resp.Errors", resp.Errors)
-			for _, sub := range batch.subscribers {
-				sub.respC <- gqlStatusErr(err)
-			}
-			return
 		}
+		cancel()
+	}()
 
-		for id, sub := range batch.subscribers {
-			// TODO: missing response.
-			byt, err := json.Marshal(map[string]any{
-				sub.field: data[id],
-			})
-			if err != nil {
-				sub.respC <- err
+	err = c.wrapped.MakeRequest(ctx, req, resp)
+
+	// Extract any field-level errors, and return them to their
+	// subscribers. We can ignore the top-level err in this case, because
+	// it's just the wrapped version of our response errors.
+	if resp != nil && len(resp.Errors) > 0 {
+		for _, e := range resp.Errors {
+			sub, ok := batch.subscribers[e.Path.String()]
+			if !ok {
 				continue
 			}
-
-			sub.respC <- sonic.ConfigStd.Unmarshal(byt, &sub.resp.Data)
+			sub.respC <- gqlStatusErr(e)
+			// Remove our subscriber because we already responded.
+			delete(batch.subscribers, e.Path.String())
 		}
-	}(batch)
+	} else if err != nil {
+		// For everything else return the status code to all our subscribers.
+		Log(ctx).Warn("batched query error", "count", len(batch.subscribers), "err", err, "resp.Errors", resp.Errors)
+		for _, sub := range batch.subscribers {
+			sub.respC <- gqlStatusErr(err)
+		}
+		return
+	}
+
+	for id, sub := range batch.subscribers {
+		// TODO: missing response.
+		byt, err := json.Marshal(map[string]any{
+			sub.field: data[id],
+		})
+		if err != nil {
+			sub.respC <- err
+			continue
+		}
+
+		sub.respC <- sonic.ConfigStd.Unmarshal(byt, &sub.resp.Data)
+	}
 }
 
 // MakeRequest implements graphql.Client.
@@ -201,8 +224,13 @@ func (c *batchedgqlclient) MakeRequest(
 	req *graphql.Request,
 	resp *graphql.Response,
 ) error {
-	err := <-c.enqueue(ctx, req, resp).respC
-	return err
+	// respC is buffered, so the batch can still answer after we've gone.
+	select {
+	case err := <-c.enqueue(ctx, req, resp).respC:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // enqueue adds a query to the batch and returns a subscription whose result
@@ -246,48 +274,11 @@ func (c *batchedgqlclient) enqueue(
 		resp:  resp,
 		respC: respC,
 		field: field,
+		query: req.Query,
+		vars:  vars,
 	}
 
 	return sub
-}
-
-// tokenBucket is a token-bucket rate limiter: it refills at a steady rate up
-// to a fixed capacity, and callers reserve tokens ahead of using them. It isn't
-// safe for concurrent use; batchedgqlclient guards it with its mutex.
-type tokenBucket struct {
-	capacity float64
-	perSec   float64
-	tokens   float64 // Negative when callers have reserved more than we have.
-	last     time.Time
-	now      func() time.Time
-}
-
-// newTokenBucket returns a full bucket that refills at perMinute tokens per
-// minute and holds at most burst.
-func newTokenBucket(perMinute, burst int, now func() time.Time) *tokenBucket {
-	return &tokenBucket{
-		capacity: float64(burst),
-		perSec:   float64(perMinute) / 60,
-		tokens:   float64(burst),
-		last:     now(),
-		now:      now,
-	}
-}
-
-// reserve spends n tokens and returns how long the caller must wait before
-// using them. The wait is zero while the bucket has enough; otherwise the
-// bucket goes into debt, so later callers queue up behind this one in order
-// and the long-run rate holds no matter how large n is.
-func (b *tokenBucket) reserve(n int) time.Duration {
-	now := b.now()
-	b.tokens = min(b.capacity, b.tokens+now.Sub(b.last).Seconds()*b.perSec)
-	b.last = now
-
-	b.tokens -= float64(n)
-	if b.tokens >= 0 {
-		return 0
-	}
-	return time.Duration(-b.tokens / b.perSec * float64(time.Second))
 }
 
 // subscription holds information about a caller who is waiting for a query to
@@ -297,6 +288,9 @@ type subscription struct {
 	resp  *graphql.Response
 	respC chan error
 	field string
+	// query and vars rebuild the batch if other subscribers drop out.
+	query string
+	vars  map[string]any
 }
 
 // gqlStatusErr translates errors into meaningful status codes. The client

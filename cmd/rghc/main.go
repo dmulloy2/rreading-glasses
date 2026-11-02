@@ -67,22 +67,30 @@ func (s *server) Run() error {
 		s.HardcoverAuth = string(bytes.TrimSpace(s.HardcoverAuthFile))
 	}
 
+	if s.BatchSize < 1 {
+		return fmt.Errorf("batch size must be at least 1, got %d", s.BatchSize)
+	}
+
+	// Pacing sits below the retries, so every attempt, a retry included, waits
+	// for budget, and a 429 makes every pending batch back off.
 	hcTransport := internal.ScopedTransport{
 		Host: s.Upstream,
 		RoundTripper: &internal.HeaderTransport{
-			Key:          "Authorization",
-			Value:        s.HardcoverAuth,
-			RoundTripper: &internal.RetryTransport{Attempts: s.RetryAttempts, RoundTripper: http.DefaultTransport},
+			Key:   "Authorization",
+			Value: s.HardcoverAuth,
+			RoundTripper: &internal.RetryTransport{
+				Attempts: s.RetryAttempts,
+				RoundTripper: &internal.PacedTransport{
+					Limiter:      internal.NewRateLimiter(s.RatePerMinute, s.BatchSize),
+					RoundTripper: http.DefaultTransport,
+				},
+			},
 		},
 	}
 
 	hcClient := &http.Client{Transport: hcTransport}
 
-	if s.BatchSize < 1 {
-		return fmt.Errorf("batch size must be at least 1, got %d", s.BatchSize)
-	}
-
-	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, s.BatchSize, reg, internal.WithRateLimit(s.RatePerMinute))
+	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, s.BatchSize, reg)
 	if err != nil {
 		return err
 	}

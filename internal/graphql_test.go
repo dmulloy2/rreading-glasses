@@ -390,68 +390,6 @@ func TestBatchingOverflow(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load())
 }
 
-func TestTokenBucket(t *testing.T) {
-	now := time.Unix(1000, 0)
-	b := newTokenBucket(60, 10, func() time.Time { return now }) // 1/s, burst 10.
-
-	assert.Equal(t, time.Duration(0), b.reserve(10), "a new bucket is full")
-	assert.Equal(t, time.Second, b.reserve(1), "the next token is a second away")
-	assert.Equal(t, 2*time.Second, b.reserve(1), "and callers queue up behind each other")
-
-	now = now.Add(2 * time.Second)
-	assert.Equal(t, time.Second, b.reserve(1), "time pays down the debt")
-
-	now = now.Add(time.Hour)
-	assert.Equal(t, time.Duration(0), b.reserve(10), "refill is capped at the burst")
-	assert.Equal(t, 10*time.Second, b.reserve(10))
-	assert.Equal(t, 25*time.Second, b.reserve(15), "a request larger than the burst just waits longer")
-}
-
-func TestBatchingPaced(t *testing.T) {
-	var mu sync.Mutex
-	var sent []time.Time
-
-	client := &http.Client{
-		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-			mu.Lock()
-			sent = append(sent, time.Now())
-			mu.Unlock()
-			body := `{"data": {}, "errors": []}`
-			return &http.Response{
-				StatusCode: 200,
-				Body:       io.NopCloser(strings.NewReader(body)),
-			}, nil
-		}),
-	}
-
-	// Batches of 2 queries, refilling at 10 a second: the first batch goes
-	// out at once, and each one after is delayed by another 2 tokens (~200ms).
-	gql, err := NewBatchedGraphQLClient("https://foo.com", client, 10*time.Millisecond, 2, nil, WithRateLimit(600))
-	require.NoError(t, err)
-
-	start := time.Now()
-
-	wg := sync.WaitGroup{}
-	errs := make([]error, 6)
-	for i := range errs {
-		wg.Go(func() {
-			_, errs[i] = gr.GetBook(t.Context(), gql, int64(i+1))
-		})
-	}
-	wg.Wait()
-
-	for _, err := range errs {
-		assert.NoError(t, err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.Len(t, sent, 3)
-	assert.Less(t, sent[0].Sub(start), 150*time.Millisecond, "the first batch spends the burst")
-	assert.GreaterOrEqual(t, sent[1].Sub(sent[0]), 150*time.Millisecond, "the second waits for tokens")
-	assert.GreaterOrEqual(t, sent[2].Sub(sent[1]), 150*time.Millisecond, "and so does the third")
-}
-
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {

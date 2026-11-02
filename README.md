@@ -131,7 +131,9 @@ The defaults suit the Free tier. Raise them if your tier allows more:
 * `--rate-per-minute` / `HARDCOVER_RATE_PER_MINUTE` (default `60`): the
   sustained rate. Batches that would go over it are delayed, in order, so the
   first lookups after a quiet spell are quick and a long refresh is spread out.
-  `0` turns pacing off.
+  Retries count against it too, a 429 makes every pending request back off, and
+  a lookup whose caller has given up is dropped instead of sent. `0` turns
+  pacing off.
 
 The daily allowance is not tracked. Once it runs out, lookups fail until it
 resets, so a large library takes a few days to load the first time. Everything
