@@ -161,6 +161,13 @@ func AuthorKey(authorID int64) string {
 	return fmt.Sprintf("a%d", authorID)
 }
 
+// searchHitKey is the cache key for what a search result needs to know about a
+// work. It is kept apart from WorkKey so a search never stands in for the full
+// work and the edges the controller persists alongside it.
+func searchHitKey(workID int64) string {
+	return fmt.Sprintf("h%d", workID)
+}
+
 func seriesKey(seriesID int64) string {
 	return fmt.Sprintf("s%d", seriesID)
 }

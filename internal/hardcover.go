@@ -62,40 +62,66 @@ func (g *HCGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 
 	for _, workID := range workIDs {
 		wg.Go(func() {
-			id := workID
-
-			bytes, _, err := g.GetWork(ctx, id, nil)
-			if err != nil {
-				return
-			}
-
-			var workRsc workResource
-			err = json.Unmarshal(bytes, &workRsc)
-			if err != nil {
-				return
-			}
-
-			if len(workRsc.Authors) == 0 {
-				Log(ctx).Warn("work is missing an author", "workID", id, "err", err)
+			hit, ok := g.searchHit(ctx, workID)
+			if !ok {
 				return
 			}
 
 			mu.Lock()
 			defer mu.Unlock()
 
-			results = append(results, SearchResource{
-				BookID: workRsc.BestBookID,
-				WorkID: workRsc.ForeignID,
-				Author: SearchResourceAuthor{
-					ID: workRsc.Authors[0].ForeignID,
-				},
-			})
+			results = append(results, hit)
 		})
 	}
 
 	wg.Wait()
 
 	return results, nil
+}
+
+// searchHit returns what a search result needs to know about a work: its best
+// edition and first author. Looking that up costs two upstream queries, and a
+// search returns a dozen or more works, so it is cached: the same or an
+// overlapping search, like the next keystroke of a title, then costs one query
+// instead of dozens. A rate-limited account can afford few of those.
+func (g *HCGetter) searchHit(ctx context.Context, workID int64) (SearchResource, bool) {
+	key := searchHitKey(workID)
+	if cached, ttl, ok := g.cache.GetWithTTL(ctx, key); ok && ttl > 0 {
+		var hit SearchResource
+		if err := json.Unmarshal(cached, &hit); err == nil {
+			return hit, true
+		}
+	}
+
+	bytes, _, err := g.GetWork(ctx, workID, nil)
+	if err != nil {
+		return SearchResource{}, false
+	}
+
+	var workRsc workResource
+	if err := json.Unmarshal(bytes, &workRsc); err != nil {
+		return SearchResource{}, false
+	}
+
+	if len(workRsc.Authors) == 0 {
+		Log(ctx).Warn("work is missing an author", "workID", workID)
+		return SearchResource{}, false
+	}
+
+	hit := SearchResource{
+		BookID: workRsc.BestBookID,
+		WorkID: workRsc.ForeignID,
+		Author: SearchResourceAuthor{
+			ID: workRsc.Authors[0].ForeignID,
+		},
+	}
+
+	// Same lifetime as the work it summarizes.
+	if encoded, err := json.Marshal(hit); err == nil {
+		g.cache.Set(ctx, key, encoded, _workTTL)
+	}
+
+	return hit, true
 }
 
 // GetWork returns the canonical edition for a work.
