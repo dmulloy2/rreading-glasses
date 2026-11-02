@@ -35,6 +35,8 @@ type server struct {
 	Upstream string `default:"api.hardcover.app" env:"UPSTREAM" help:"Upstream host (e.g. www.example.com)."`
 
 	RetryAttempts int    `default:"5" env:"RETRY_ATTEMPTS" help:"Attempts for upstream requests that fail with 429, 502, 503 or 504, including the first (1 disables retries)."`
+	BatchSize     int    `default:"10" env:"HARDCOVER_BATCH_SIZE" help:"Most queries sent to Hardcover in one request. Hardcover rejects a request with more top-level fields than the account's burst allowance (10 on the Free tier)."`
+	RatePerMinute int    `default:"60" env:"HARDCOVER_RATE_PER_MINUTE" help:"Sustained queries per minute sent to Hardcover (60 on the Free tier), with bursts of up to one batch. 0 disables pacing."`
 	IgnoreSeries  string `default:"" env:"IGNORE_SERIES" help:"Case-insensitive regular expression; works in a series whose title matches are left out of author lists (e.g. 'split[- ]volumes?' for translations published in volumes)."`
 	InferLanguage bool   `default:"false" env:"INFER_LANGUAGE" help:"Label blank-language editions with a non-English language code when the title clearly isn't English, so downstream language filters can drop them."`
 
@@ -76,7 +78,11 @@ func (s *server) Run() error {
 
 	hcClient := &http.Client{Transport: hcTransport}
 
-	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, 25 /* Not sure about this */, reg)
+	if s.BatchSize < 1 {
+		return fmt.Errorf("batch size must be at least 1, got %d", s.BatchSize)
+	}
+
+	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, s.BatchSize, reg, internal.WithRateLimit(s.RatePerMinute))
 	if err != nil {
 		return err
 	}

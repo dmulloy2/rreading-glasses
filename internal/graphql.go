@@ -33,13 +33,28 @@ type batchedgqlclient struct {
 	queue     []batchedQuery // queue contains spillover in cases where we've accumulated more queries than our batch size allows.
 	every     time.Duration  // every controls how often requests are flushed.
 	metrics   *gqlMetrics    // metrics tracks batches and queries sent.
+	limiter   *tokenBucket   // limiter, when set, paces batches so we stay inside the upstream's rate limit.
 
 	wrapped graphql.Client
 }
 
+// BatchedOption configures a batching GraphQL client.
+type BatchedOption func(*batchedgqlclient, *int)
+
+// WithRateLimit paces batches so that no more than perMinute queries are sent
+// per minute on average, allowing bursts of up to one full batch. This matches
+// token-bucket limits like Hardcover's, where each top-level field costs one
+// token and a request larger than the burst allowance is rejected outright.
+// Zero or less leaves the client unpaced.
+func WithRateLimit(perMinute int) BatchedOption {
+	return func(_ *batchedgqlclient, rate *int) {
+		*rate = perMinute
+	}
+}
+
 // NewBatchedGraphQLClient creates a batching GraphQL client. Queries are
 // accumulated and executed regularly accurding to the given rate.
-func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duration, batchSize int, reg *prometheus.Registry) (graphql.Client, error) {
+func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duration, batchSize int, reg *prometheus.Registry, opts ...BatchedOption) (graphql.Client, error) {
 	wrapped := graphql.NewClient(url, client)
 
 	c := &batchedgqlclient{
@@ -48,6 +63,14 @@ func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duratio
 		queue:     []batchedQuery{},
 		metrics:   newGQLMetrics(reg),
 		every:     every,
+	}
+
+	perMinute := 0
+	for _, opt := range opts {
+		opt(c, &perMinute)
+	}
+	if perMinute > 0 {
+		c.limiter = newTokenBucket(perMinute, batchSize, time.Now)
 	}
 
 	go func() {
@@ -93,8 +116,14 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 		return // Nothing to do yet.
 	}
 
-	// Take our oldest batch off the queue.
+	// Hold the oldest batch until we have budget for all of it. It stays at
+	// the head of the queue, and can keep filling, until the next tick.
 	batch := c.queue[0]
+	if c.limiter != nil && !c.limiter.take(len(batch.subscribers)) {
+		return
+	}
+
+	// Take our oldest batch off the queue.
 	c.queue = c.queue[1:]
 
 	c.metrics.batchesSentInc()
@@ -215,6 +244,45 @@ func (c *batchedgqlclient) enqueue(
 	}
 
 	return sub
+}
+
+// tokenBucket is a token-bucket rate limiter: it refills at a steady rate up
+// to a fixed capacity, and take spends tokens only if enough are available.
+// It isn't safe for concurrent use; batchedgqlclient guards it with its mutex.
+type tokenBucket struct {
+	capacity float64
+	perSec   float64
+	tokens   float64
+	last     time.Time
+	now      func() time.Time
+}
+
+// newTokenBucket returns a full bucket that refills at perMinute tokens per
+// minute and holds at most burst.
+func newTokenBucket(perMinute, burst int, now func() time.Time) *tokenBucket {
+	return &tokenBucket{
+		capacity: float64(burst),
+		perSec:   float64(perMinute) / 60,
+		tokens:   float64(burst),
+		last:     now(),
+		now:      now,
+	}
+}
+
+// take spends n tokens and reports whether it could. A request for more than
+// the bucket can ever hold is treated as a request for its whole capacity, so
+// an oversized batch is delayed rather than starved.
+func (b *tokenBucket) take(n int) bool {
+	now := b.now()
+	b.tokens = min(b.capacity, b.tokens+now.Sub(b.last).Seconds()*b.perSec)
+	b.last = now
+
+	need := min(float64(n), b.capacity)
+	if b.tokens < need {
+		return false
+	}
+	b.tokens -= need
+	return true
 }
 
 // subscription holds information about a caller who is waiting for a query to

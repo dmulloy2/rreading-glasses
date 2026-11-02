@@ -116,6 +116,27 @@ When using Hardcover you must set the `hardcover-auth` parameter.
 Note that your API key **will expire every year on January 1**, so you'll need
 to periodically regenerate it.
 
+### Hardcover rate limits
+
+Hardcover meters API access per account tier, counting each top-level GraphQL
+field as one query. Responses carry the account's limits in a `ratelimit-policy`
+header; on the Free tier that is 60 queries per minute with a burst of 10, and
+5,000 per day. A request with more fields than the burst allowance is rejected
+with a 403 `request_exceeds_capacity`, and anything over the rate gets a 429.
+
+The defaults suit the Free tier. Raise them if your tier allows more:
+
+* `--batch-size` / `HARDCOVER_BATCH_SIZE` (default `10`): the most queries sent
+  in one request. Keep it at or below your tier's burst.
+* `--rate-per-minute` / `HARDCOVER_RATE_PER_MINUTE` (default `60`): the
+  sustained rate. Batches are held back until there is budget for them, so the
+  first lookups after a quiet spell are quick and a long refresh is spread out.
+  `0` turns pacing off.
+
+The daily allowance is not tracked. Once it runs out, lookups fail until it
+resets, so a large library takes a few days to load the first time. Everything
+is cached in Postgres, so repeat lookups cost nothing.
+
 ### Resource Requirements
 
 Resource requirements are minimal; a Raspberry Pi should suffice. Storage
