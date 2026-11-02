@@ -116,15 +116,18 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 		return // Nothing to do yet.
 	}
 
-	// Hold the oldest batch until we have budget for all of it. It stays at
-	// the head of the queue, and can keep filling, until the next tick.
-	batch := c.queue[0]
-	if c.limiter != nil && !c.limiter.take(len(batch.subscribers)) {
-		return
-	}
-
 	// Take our oldest batch off the queue.
+	batch := c.queue[0]
 	c.queue = c.queue[1:]
+
+	// Reserve budget for the batch. If we're ahead of the rate limit it waits
+	// its turn before it's sent. Reserving, rather than waiting for enough
+	// budget to appear, keeps a large batch from being starved by small ones
+	// that arrive after it.
+	var wait time.Duration
+	if c.limiter != nil {
+		wait = c.limiter.reserve(len(batch.subscribers))
+	}
 
 	c.metrics.batchesSentInc()
 	c.metrics.queriesSentAdd(int64(len(batch.subscribers)))
@@ -148,6 +151,8 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 	// Issue the request in a separate goroutine so we can continue to
 	// accumulate queries without needing to wait for the network call.
 	go func(batch batchedQuery) {
+		time.Sleep(wait)
+
 		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 
@@ -247,12 +252,12 @@ func (c *batchedgqlclient) enqueue(
 }
 
 // tokenBucket is a token-bucket rate limiter: it refills at a steady rate up
-// to a fixed capacity, and take spends tokens only if enough are available.
-// It isn't safe for concurrent use; batchedgqlclient guards it with its mutex.
+// to a fixed capacity, and callers reserve tokens ahead of using them. It isn't
+// safe for concurrent use; batchedgqlclient guards it with its mutex.
 type tokenBucket struct {
 	capacity float64
 	perSec   float64
-	tokens   float64
+	tokens   float64 // Negative when callers have reserved more than we have.
 	last     time.Time
 	now      func() time.Time
 }
@@ -269,20 +274,20 @@ func newTokenBucket(perMinute, burst int, now func() time.Time) *tokenBucket {
 	}
 }
 
-// take spends n tokens and reports whether it could. A request for more than
-// the bucket can ever hold is treated as a request for its whole capacity, so
-// an oversized batch is delayed rather than starved.
-func (b *tokenBucket) take(n int) bool {
+// reserve spends n tokens and returns how long the caller must wait before
+// using them. The wait is zero while the bucket has enough; otherwise the
+// bucket goes into debt, so later callers queue up behind this one in order
+// and the long-run rate holds no matter how large n is.
+func (b *tokenBucket) reserve(n int) time.Duration {
 	now := b.now()
 	b.tokens = min(b.capacity, b.tokens+now.Sub(b.last).Seconds()*b.perSec)
 	b.last = now
 
-	need := min(float64(n), b.capacity)
-	if b.tokens < need {
-		return false
+	b.tokens -= float64(n)
+	if b.tokens >= 0 {
+		return 0
 	}
-	b.tokens -= need
-	return true
+	return time.Duration(-b.tokens / b.perSec * float64(time.Second))
 }
 
 // subscription holds information about a caller who is waiting for a query to

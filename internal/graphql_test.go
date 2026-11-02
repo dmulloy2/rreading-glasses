@@ -394,24 +394,17 @@ func TestTokenBucket(t *testing.T) {
 	now := time.Unix(1000, 0)
 	b := newTokenBucket(60, 10, func() time.Time { return now }) // 1/s, burst 10.
 
-	assert.True(t, b.take(10), "a new bucket is full")
-	assert.False(t, b.take(1), "and then empty")
+	assert.Equal(t, time.Duration(0), b.reserve(10), "a new bucket is full")
+	assert.Equal(t, time.Second, b.reserve(1), "the next token is a second away")
+	assert.Equal(t, 2*time.Second, b.reserve(1), "and callers queue up behind each other")
 
-	now = now.Add(time.Second)
-	assert.True(t, b.take(1), "refills one token a second")
-	assert.False(t, b.take(1))
-
-	now = now.Add(5 * time.Second)
-	assert.False(t, b.take(6), "not enough yet")
-	assert.True(t, b.take(5))
+	now = now.Add(2 * time.Second)
+	assert.Equal(t, time.Second, b.reserve(1), "time pays down the debt")
 
 	now = now.Add(time.Hour)
-	assert.True(t, b.take(10), "refill is capped at the burst")
-	assert.False(t, b.take(1))
-
-	now = now.Add(time.Hour)
-	assert.True(t, b.take(25), "a request larger than the bucket is treated as the whole bucket")
-	assert.False(t, b.take(1))
+	assert.Equal(t, time.Duration(0), b.reserve(10), "refill is capped at the burst")
+	assert.Equal(t, 10*time.Second, b.reserve(10))
+	assert.Equal(t, 25*time.Second, b.reserve(15), "a request larger than the burst just waits longer")
 }
 
 func TestBatchingPaced(t *testing.T) {
@@ -432,7 +425,7 @@ func TestBatchingPaced(t *testing.T) {
 	}
 
 	// Batches of 2 queries, refilling at 10 a second: the first batch goes
-	// out at once, and each one after waits for another 2 tokens (~200ms).
+	// out at once, and each one after is delayed by another 2 tokens (~200ms).
 	gql, err := NewBatchedGraphQLClient("https://foo.com", client, 10*time.Millisecond, 2, nil, WithRateLimit(600))
 	require.NoError(t, err)
 

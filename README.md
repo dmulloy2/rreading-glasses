@@ -129,7 +129,7 @@ The defaults suit the Free tier. Raise them if your tier allows more:
 * `--batch-size` / `HARDCOVER_BATCH_SIZE` (default `10`): the most queries sent
   in one request. Keep it at or below your tier's burst.
 * `--rate-per-minute` / `HARDCOVER_RATE_PER_MINUTE` (default `60`): the
-  sustained rate. Batches are held back until there is budget for them, so the
+  sustained rate. Batches that would go over it are delayed, in order, so the
   first lookups after a quiet spell are quick and a long refresh is spread out.
   `0` turns pacing off.
 
